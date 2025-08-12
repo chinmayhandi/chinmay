@@ -1,0 +1,1960 @@
+"""
+railway_system_full.py
+
+Comprehensive Railway Management System (Tkinter + SQLite)
+
+Features:
+- Admin & User login with SHA256 hashed passwords
+- Stations management (code & name)
+- Trains with multi-class coaches and seat-level allocation
+- Route timings (validated in IST, must be future)
+- Bookings with class/coach/seat selection & PNR generation
+- Payment simulation (Cash, UPI, Card)
+- Cancellation with refund calc (percentage depends on time before departure)
+- Reports and CSV export, printable tickets (txt, optional PDF)
+- UI: Tkinter Notebook, Treeviews, forms, background image (Pillow)
+- Validations for email, phone, codes, train numbers
+
+Run: python railway_system_full.py
+"""
+
+import sqlite3
+from sqlite3 import Error
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+from datetime import datetime, timedelta, timezone
+import hashlib
+import re
+import json
+import csv
+import os
+import random
+import string
+import sys
+
+# Optional libs for nicer features
+try:
+    from PIL import Image, ImageTk
+    PIL_AVAILABLE = True
+except Exception:
+    PIL_AVAILABLE = False
+
+try:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas as pdf_canvas
+    REPORTLAB_AVAILABLE = True
+except Exception:
+    REPORTLAB_AVAILABLE = False
+
+# ----------------- Config -----------------
+DB_FILE = "railway_full.db"
+IST = timezone(timedelta(hours=5, minutes=30))  # India Standard Time
+
+# Refund policy (example):
+# - >48 hours before departure: 90% refund
+# - 24-48 hours: 50%
+# - <24 hours: 20%
+REFUND_POLICY = [
+    (48, 0.9),
+    (24, 0.5),
+    (0, 0.2)
+]
+
+# ----------------- Helpers -----------------
+
+def now_ist():
+    return datetime.now(IST)
+
+def sha256_hash(s: str) -> str:
+    return hashlib.sha256(s.encode('utf-8')).hexdigest()
+
+def gen_pnr(length=8):
+    # A simple PNR generator: uppercase letters + digits
+    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
+
+def valid_email(email):
+    if not email: return True  # optional
+    regex = r'^[\w\.-]+@[\w\.-]+\.\w{2,}$'
+    return re.match(regex, email) is not None
+
+def valid_phone(phone):
+    if not phone: return True  # optional
+    # Allow Indian 10-digit numbers with optional +91 or 0 prefix
+    regex = r'^(\+91|0)?[6-9]\d{9}$'
+    return re.match(regex, phone) is not None
+
+def valid_station_code(code):
+    if not code: return False
+    return re.match(r'^[A-Z]{2,5}$', code) is not None
+
+def valid_train_number(tno):
+    return re.match(r'^[0-9A-Za-z\-]{1,10}$', tno) is not None
+
+def format_dt(dt_str):
+    try:
+        dt = datetime.fromisoformat(dt_str)
+        return dt.astimezone(IST).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return dt_str
+
+# ----------------- Database -----------------
+
+def create_connection(db_file):
+    try:
+        conn = sqlite3.connect(db_file, detect_types=sqlite3.PARSE_DECLTYPES|sqlite3.PARSE_COLNAMES)
+        conn.execute("PRAGMA foreign_keys = ON")
+        return conn
+    except Error as e:
+        print("DB Connection error:", e)
+    return None
+
+def create_tables(conn):
+    c = conn.cursor()
+    # users: admins and regular users
+    c.execute('''
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        is_admin INTEGER DEFAULT 0,
+        full_name TEXT,
+        email TEXT,
+        phone TEXT
+    )
+    ''')
+    # stations
+    c.execute('''
+    CREATE TABLE IF NOT EXISTS stations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        code TEXT UNIQUE NOT NULL,
+        name TEXT NOT NULL
+    )''')
+    # trains: basic metadata; route JSON contains list of stops with station_code, arrival, departure, distance
+    c.execute('''
+    CREATE TABLE IF NOT EXISTS trains (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        train_number TEXT UNIQUE NOT NULL,
+        train_name TEXT NOT NULL,
+        route_json TEXT, -- JSON array of stops
+        created_at TEXT
+    )''')
+    # train_coaches: each train may have multiple coaches, each coach has a class (SL/3A/2A/1A), label (S1,A1,B1...), seat_count, fare_per_seat
+    c.execute('''
+    CREATE TABLE IF NOT EXISTS train_coaches (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        train_id INTEGER NOT NULL,
+        class TEXT NOT NULL,
+        coach_label TEXT NOT NULL,
+        seat_count INTEGER NOT NULL,
+        fare REAL NOT NULL,
+        seats_json TEXT, -- JSON object mapping seat_no -> status ('FREE'|'BOOKED') and optionally booking_id
+        FOREIGN KEY(train_id) REFERENCES trains(id) ON DELETE CASCADE
+    )''')
+    # passengers
+    c.execute('''
+    CREATE TABLE IF NOT EXISTS passengers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        email TEXT,
+        phone TEXT
+    )''')
+    # bookings
+    c.execute('''
+    CREATE TABLE IF NOT EXISTS bookings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        pnr TEXT UNIQUE NOT NULL,
+        train_id INTEGER NOT NULL,
+        coach_id INTEGER NOT NULL,
+        seat_no TEXT NOT NULL,
+        passenger_id INTEGER NOT NULL,
+        travel_class TEXT NOT NULL,
+        booking_time TEXT NOT NULL,
+        status TEXT DEFAULT 'BOOKED',
+        fare_paid REAL NOT NULL,
+        departure_time TEXT NOT NULL,
+        user_id INTEGER, -- who booked (nullable)
+        FOREIGN KEY(train_id) REFERENCES trains(id),
+        FOREIGN KEY(coach_id) REFERENCES train_coaches(id),
+        FOREIGN KEY(passenger_id) REFERENCES passengers(id),
+        FOREIGN KEY(user_id) REFERENCES users(id)
+    )''')
+    # payments
+    c.execute('''
+    CREATE TABLE IF NOT EXISTS payments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        booking_id INTEGER,
+        method TEXT,
+        amount REAL,
+        payment_time TEXT,
+        status TEXT,
+        FOREIGN KEY(booking_id) REFERENCES bookings(id) ON DELETE CASCADE
+    )''')
+    conn.commit()
+
+    # Ensure default admin user exists
+    c.execute("SELECT COUNT(*) FROM users")
+    if c.fetchone()[0] == 0:
+        admin_hash = sha256_hash("admin123")
+        c.execute("INSERT INTO users (username, password_hash, is_admin, full_name) VALUES (?, ?, ?, ?)",
+                  ("admin", admin_hash, 1, "Administrator"))
+        conn.commit()
+
+# ----------------- DB CRUD helpers -----------------
+
+# Users
+def add_user(conn, username, password, is_admin=0, full_name=None, email=None, phone=None):
+    cur = conn.cursor()
+    phash = sha256_hash(password)
+    cur.execute("INSERT INTO users (username, password_hash, is_admin, full_name, email, phone) VALUES (?, ?, ?, ?, ?, ?)",
+                (username, phash, is_admin, full_name, email, phone))
+    conn.commit()
+    return cur.lastrowid
+
+def authenticate(conn, username, password):
+    cur = conn.cursor()
+    cur.execute("SELECT id, password_hash, is_admin, full_name FROM users WHERE username=?", (username,))
+    row = cur.fetchone()
+    if not row:
+        return None
+    uid, phash, is_admin, full_name = row
+    if sha256_hash(password) == phash:
+        return {"id": uid, "is_admin": bool(is_admin), "username": username, "full_name": full_name}
+    return None
+
+# Stations
+def add_station(conn, code, name):
+    cur = conn.cursor()
+    cur.execute("INSERT INTO stations (code, name) VALUES (?, ?)", (code, name))
+    conn.commit()
+    return cur.lastrowid
+
+def update_station(conn, sid, code, name):
+    cur = conn.cursor()
+    cur.execute("UPDATE stations SET code=?, name=? WHERE id=?", (code, name, sid))
+    conn.commit()
+
+def delete_station(conn, sid):
+    cur = conn.cursor()
+    cur.execute("DELETE FROM stations WHERE id=?", (sid,))
+    conn.commit()
+
+def fetch_stations(conn, filter_text=None):
+    cur = conn.cursor()
+    if filter_text:
+        like = f"%{filter_text}%"
+        cur.execute("SELECT id, code, name FROM stations WHERE code LIKE ? OR name LIKE ? ORDER BY id", (like, like))
+    else:
+        cur.execute("SELECT id, code, name FROM stations ORDER BY id")
+    return cur.fetchall()
+
+# Trains & coaches
+def add_train(conn, train_number, train_name, route_stops):
+    # route_stops is a list of dicts: {"station_code": "NDLS", "arrival": iso_str_or_empty, "departure": iso_str, "distance": float}
+    cur = conn.cursor()
+    created_at = datetime.now(IST).isoformat()
+    route_json = json.dumps(route_stops)
+    cur.execute("INSERT INTO trains (train_number, train_name, route_json, created_at) VALUES (?, ?, ?, ?)",
+                (train_number, train_name, route_json, created_at))
+    conn.commit()
+    return cur.lastrowid
+
+def update_train(conn, train_id, train_number, train_name, route_stops):
+    cur = conn.cursor()
+    route_json = json.dumps(route_stops)
+    cur.execute("UPDATE trains SET train_number=?, train_name=?, route_json=? WHERE id=?", (train_number, train_name, route_json, train_id))
+    conn.commit()
+
+def delete_train(conn, train_id):
+    cur = conn.cursor()
+    cur.execute("DELETE FROM trains WHERE id=?", (train_id,))
+    conn.commit()
+
+def fetch_trains(conn, filter_text=None):
+    cur = conn.cursor()
+    if filter_text:
+        like = f"%{filter_text}%"
+        cur.execute("SELECT id, train_number, train_name, route_json, created_at FROM trains WHERE train_number LIKE ? OR train_name LIKE ? ORDER BY id", (like, like))
+    else:
+        cur.execute("SELECT id, train_number, train_name, route_json, created_at FROM trains ORDER BY id")
+    rows = cur.fetchall()
+    # parse route_json in memory when needed
+    return rows
+
+# Coaches
+def add_coach(conn, train_id, cls, coach_label, seat_count, fare):
+    cur = conn.cursor()
+    seats = {str(i+1): "FREE" for i in range(int(seat_count))}
+    seats_json = json.dumps(seats)
+    cur.execute("INSERT INTO train_coaches (train_id, class, coach_label, seat_count, fare, seats_json) VALUES (?, ?, ?, ?, ?, ?)",
+                (train_id, cls, coach_label, seat_count, fare, seats_json))
+    conn.commit()
+    return cur.lastrowid
+
+def update_coach(conn, coach_id, cls, coach_label, seat_count, fare):
+    cur = conn.cursor()
+    # if seat count changes, rebuild seats_json keeping existing booked seats if possible
+    cur.execute("SELECT seats_json FROM train_coaches WHERE id=?", (coach_id,))
+    row = cur.fetchone()
+    seats_json = {}
+    if row:
+        try:
+            seats_json = json.loads(row[0] or "{}")
+        except Exception:
+            seats_json = {}
+    seats = {}
+    for i in range(int(seat_count)):
+        key = str(i+1)
+        seats[key] = seats_json.get(key, "FREE")
+    cur.execute("UPDATE train_coaches SET class=?, coach_label=?, seat_count=?, fare=?, seats_json=? WHERE id=?",
+                (cls, coach_label, seat_count, fare, json.dumps(seats), coach_id))
+    conn.commit()
+
+def delete_coach(conn, coach_id):
+    cur = conn.cursor()
+    cur.execute("DELETE FROM train_coaches WHERE id=?", (coach_id,))
+    conn.commit()
+
+def fetch_coaches_for_train(conn, train_id):
+    cur = conn.cursor()
+    cur.execute("SELECT id, class, coach_label, seat_count, fare, seats_json FROM train_coaches WHERE train_id=? ORDER BY id", (train_id,))
+    return cur.fetchall()
+
+# Passengers
+def add_passenger(conn, name, email=None, phone=None):
+    cur = conn.cursor()
+    cur.execute("INSERT INTO passengers (name, email, phone) VALUES (?, ?, ?)", (name, email, phone))
+    conn.commit()
+    return cur.lastrowid
+
+def update_passenger(conn, pid, name, email=None, phone=None):
+    cur = conn.cursor()
+    cur.execute("UPDATE passengers SET name=?, email=?, phone=? WHERE id=?", (name, email, phone, pid))
+    conn.commit()
+
+def delete_passenger(conn, pid):
+    cur = conn.cursor()
+    cur.execute("DELETE FROM passengers WHERE id=?", (pid,))
+    conn.commit()
+
+def fetch_passengers(conn, filter_text=None):
+    cur = conn.cursor()
+    if filter_text:
+        like = f"%{filter_text}%"
+        cur.execute("SELECT id, name, email, phone FROM passengers WHERE name LIKE ? OR email LIKE ? OR phone LIKE ? ORDER BY id", (like, like, like))
+    else:
+        cur.execute("SELECT id, name, email, phone FROM passengers ORDER BY id")
+    return cur.fetchall()
+
+# Bookings & seat operations
+def get_coach_seats(conn, coach_id):
+    cur = conn.cursor()
+    cur.execute("SELECT seats_json FROM train_coaches WHERE id=?", (coach_id,))
+    row = cur.fetchone()
+    if not row:
+        return {}
+    try:
+        return json.loads(row[0] or "{}")
+    except Exception:
+        return {}
+
+def set_coach_seats(conn, coach_id, seats_dict):
+    cur = conn.cursor()
+    cur.execute("UPDATE train_coaches SET seats_json=? WHERE id=?", (json.dumps(seats_dict), coach_id))
+    conn.commit()
+
+def book_seat(conn, train_id, coach_id, seat_no, passenger_id, travel_class, fare_paid, departure_iso, user_id=None):
+    cur = conn.cursor()
+    # Check seat is free
+    seats = get_coach_seats(conn, coach_id)
+    if seats.get(str(seat_no)) != "FREE":
+        raise ValueError("Seat not available")
+    pnr = gen_pnr(8)
+    booking_time = datetime.now(IST).isoformat()
+    cur.execute("INSERT INTO bookings (pnr, train_id, coach_id, seat_no, passenger_id, travel_class, booking_time, status, fare_paid, departure_time, user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (pnr, train_id, coach_id, str(seat_no), passenger_id, travel_class, booking_time, "BOOKED", fare_paid, departure_iso, user_id))
+    bid = cur.lastrowid
+    # mark seat booked (store booking id in seat value to allow trace)
+    seats[str(seat_no)] = f"BOOKED:{bid}"
+    set_coach_seats(conn, coach_id, seats)
+    conn.commit()
+    return bid, pnr
+
+def cancel_booking(conn, booking_id):
+    cur = conn.cursor()
+    cur.execute("SELECT train_id, coach_id, seat_no, status, departure_time, fare_paid FROM bookings WHERE id=?", (booking_id,))
+    row = cur.fetchone()
+    if not row:
+        raise ValueError("Booking not found")
+    train_id, coach_id, seat_no, status, departure_time_iso, fare_paid = row
+    if status == 'CANCELLED':
+        raise ValueError("Already cancelled")
+    # compute refund
+    dep_dt = datetime.fromisoformat(departure_time_iso).astimezone(IST)
+    now = now_ist()
+    diff_hours = (dep_dt - now).total_seconds() / 3600.0
+    refund_ratio = 0.0
+    for hours_threshold, ratio in REFUND_POLICY:
+        if diff_hours >= hours_threshold:
+            refund_ratio = ratio
+            break
+    refund_amount = fare_paid * refund_ratio
+    # mark booking cancelled
+    cur.execute("UPDATE bookings SET status='CANCELLED' WHERE id=?", (booking_id,))
+    # free seat
+    seats = get_coach_seats(conn, coach_id)
+    if seats.get(str(seat_no), "").startswith("BOOKED:"):
+        seats[str(seat_no)] = "FREE"
+        set_coach_seats(conn, coach_id, seats)
+    # record payment refund entry
+    cur.execute("INSERT INTO payments (booking_id, method, amount, payment_time, status) VALUES (?, ?, ?, ?, ?)",
+                (booking_id, "REFUND", refund_amount, datetime.now(IST).isoformat(), "COMPLETED"))
+    conn.commit()
+    return refund_amount
+
+def fetch_bookings(conn, filter_text=None):
+    cur = conn.cursor()
+    base = '''
+    SELECT b.id, b.pnr, t.train_number, t.train_name, c.coach_label, b.seat_no, p.name, b.booking_time, b.status, b.fare_paid, b.departure_time, b.user_id
+    FROM bookings b
+    JOIN trains t ON b.train_id=t.id
+    JOIN train_coaches c ON b.coach_id=c.id
+    JOIN passengers p ON b.passenger_id=p.id
+    '''
+    if filter_text:
+        like = f"%{filter_text}%"
+        base += " WHERE b.pnr LIKE ? OR t.train_number LIKE ? OR p.name LIKE ? OR b.status LIKE ?"
+        base += " ORDER BY b.id"
+        cur.execute(base, (like, like, like, like))
+    else:
+        base += " ORDER BY b.id"
+        cur.execute(base)
+    return cur.fetchall()
+
+# Payments
+def record_payment(conn, booking_id, method, amount):
+    cur = conn.cursor()
+    cur.execute("INSERT INTO payments (booking_id, method, amount, payment_time, status) VALUES (?, ?, ?, ?, ?)",
+                (booking_id, method, amount, datetime.now(IST).isoformat(), "COMPLETED"))
+    conn.commit()
+    return cur.lastrowid
+
+# Exports
+def export_to_csv(rows, headers, default_name="export.csv"):
+    path = filedialog.asksaveasfilename(defaultextension='.csv', initialfile=default_name, filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
+    if not path:
+        return None
+    try:
+        with open(path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(headers)
+            for r in rows:
+                writer.writerow(r)
+        return path
+    except Exception as e:
+        messagebox.showerror("Export Error", str(e))
+        return None
+
+# Printable ticket
+def save_ticket_text(path, booking_info, passenger_info, train_info, coach_info):
+    try:
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write("----- RAILWAY TICKET -----\n")
+            f.write(f"PNR: {booking_info['pnr']}\n")
+            f.write(f"Passenger: {passenger_info['name']} (Phone: {passenger_info.get('phone','')}, Email: {passenger_info.get('email','')})\n")
+            f.write(f"Train: {train_info['train_number']} - {train_info['train_name']}\n")
+            f.write(f"Coach: {coach_info['coach_label']}  Class: {booking_info['travel_class']}\n")
+            f.write(f"Seat No: {booking_info['seat_no']}\n")
+            f.write(f"Departure: {format_dt(booking_info['departure_time'])}\n")
+            f.write(f"Fare Paid: {booking_info['fare_paid']}\n")
+            f.write(f"Status: {booking_info['status']}\n")
+            f.write("-------------------------\n")
+        return True
+    except Exception as e:
+        return False
+
+def save_ticket_pdf(path, booking_info, passenger_info, train_info, coach_info):
+    if not REPORTLAB_AVAILABLE:
+        return False, "reportlab not installed"
+    try:
+        c = pdf_canvas.Canvas(path, pagesize=A4)
+        text = c.beginText(40, 800)
+        text.setFont("Helvetica-Bold", 12)
+        text.textLine("RAILWAY TICKET")
+        text.moveCursor(0, 12)
+        text.setFont("Helvetica", 10)
+        text.textLine(f"PNR: {booking_info['pnr']}")
+        text.textLine(f"Passenger: {passenger_info['name']}")
+        text.textLine(f"Phone: {passenger_info.get('phone','')}")
+        text.textLine(f"Email: {passenger_info.get('email','')}")
+        text.textLine("")
+        text.textLine(f"Train: {train_info['train_number']} - {train_info['train_name']}")
+        text.textLine(f"Coach: {coach_info['coach_label']}  Class: {booking_info['travel_class']}")
+        text.textLine(f"Seat No: {booking_info['seat_no']}")
+        text.textLine(f"Departure: {format_dt(booking_info['departure_time'])}")
+        text.textLine(f"Fare Paid: {booking_info['fare_paid']}")
+        text.textLine(f"Status: {booking_info['status']}")
+        c.drawText(text)
+        c.showPage()
+        c.save()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+# ----------------- GUI Application -----------------
+
+class RailwayApp:
+    def __init__(self, root, conn):
+        self.root = root
+        self.conn = conn
+        self.user = None  # current logged-in user dict
+        self.root.title("Railway Management System - Full")
+        self.root.geometry("1150x720")
+        self.style = ttk.Style(self.root)
+        try:
+            self.style.theme_use('clam')
+        except Exception:
+            pass
+
+        # optional background
+        self.bg_image = None
+        if PIL_AVAILABLE:
+            possible = ["background.jpg", "background.png"]
+            for p in possible:
+                if os.path.exists(p):
+                    try:
+                        img = Image.open(p)
+                        img = img.resize((1150, 720))
+                        self.bg_image = ImageTk.PhotoImage(img)
+                    except Exception:
+                        self.bg_image = None
+                    break
+
+        self.create_login_screen()
+
+    def create_login_screen(self):
+        for w in self.root.winfo_children():
+            w.destroy()
+        frm = ttk.Frame(self.root, padding=20)
+        frm.pack(fill='both', expand=True)
+
+        if self.bg_image:
+            lbl_bg = tk.Label(self.root, image=self.bg_image)
+            lbl_bg.place(x=0, y=0, relwidth=1, relheight=1)
+
+        left = ttk.Frame(frm, width=420, padding=12)
+        left.pack(side='left', fill='y')
+
+        ttk.Label(left, text="Railway Management", font=("Helvetica", 18, "bold")).pack(pady=8)
+        ttk.Label(left, text="Login", font=("Helvetica", 12)).pack(pady=8)
+
+        ttk.Label(left, text="Username").pack(anchor='w')
+        self.login_username = tk.StringVar()
+        ttk.Entry(left, textvariable=self.login_username).pack(fill='x')
+
+        ttk.Label(left, text="Password").pack(anchor='w', pady=(8,0))
+        self.login_password = tk.StringVar()
+        ttk.Entry(left, textvariable=self.login_password, show='*').pack(fill='x')
+
+        self.login_role = tk.StringVar(value='admin')
+        ttk.Radiobutton(left, text="Admin", variable=self.login_role, value='admin').pack(anchor='w', pady=(8,0))
+        ttk.Radiobutton(left, text="User", variable=self.login_role, value='user').pack(anchor='w')
+
+        ttk.Button(left, text="Login", command=self.handle_login).pack(pady=12)
+        ttk.Button(left, text="Register User", command=self.open_register_user).pack()
+
+        right = ttk.Frame(frm, padding=12)
+        right.pack(side='left', fill='both', expand=True)
+        ttk.Label(right, text="Instructions & Defaults", font=("Helvetica", 12, "bold")).pack(anchor='nw')
+        text = tk.Text(right, wrap='word', height=18)
+        text.insert('end', "Default admin credentials: username='admin' password='admin123'\n\n")
+        text.insert('end', "Use 'Register User' to create normal users who can book tickets.\n\n")
+        text.insert('end', "Notes:\n- Train schedules must be provided in ISO format (YYYY-MM-DD HH:MM) in IST.\n- Station codes must be uppercase (e.g., NDLS, BCT)\n- Coach labels: you can add labels like S1, S2 (SL), B1,B2 (2A), A1 (1A)\n")
+        text.config(state='disabled')
+        text.pack(fill='both', expand=True)
+
+    def open_register_user(self):
+        popup = tk.Toplevel(self.root)
+        popup.title("Register User")
+        popup.geometry("420x360")
+        frm = ttk.Frame(popup, padding=12)
+        frm.pack(fill='both', expand=True)
+
+        ttk.Label(frm, text="Username").pack(anchor='w')
+        uname = tk.StringVar()
+        ttk.Entry(frm, textvariable=uname).pack(fill='x')
+
+        ttk.Label(frm, text="Password").pack(anchor='w')
+        pwd = tk.StringVar()
+        ttk.Entry(frm, textvariable=pwd, show='*').pack(fill='x')
+
+        ttk.Label(frm, text="Full Name").pack(anchor='w', pady=(8,0))
+        fname = tk.StringVar()
+        ttk.Entry(frm, textvariable=fname).pack(fill='x')
+
+        ttk.Label(frm, text="Email").pack(anchor='w', pady=(8,0))
+        email = tk.StringVar()
+        ttk.Entry(frm, textvariable=email).pack(fill='x')
+
+        ttk.Label(frm, text="Phone").pack(anchor='w', pady=(8,0))
+        phone = tk.StringVar()
+        ttk.Entry(frm, textvariable=phone).pack(fill='x')
+
+        def submit():
+            u = uname.get().strip()
+            p = pwd.get().strip()
+            full = fname.get().strip()
+            em = email.get().strip()
+            ph = phone.get().strip()
+            if not u or not p:
+                messagebox.showwarning("Validation", "Username & password required")
+                return
+            if em and not valid_email(em):
+                messagebox.showwarning("Validation", "Invalid email")
+                return
+            if ph and not valid_phone(ph):
+                messagebox.showwarning("Validation", "Invalid phone")
+                return
+            try:
+                add_user(self.conn, u, p, is_admin=0, full_name=full, email=em, phone=ph)
+                messagebox.showinfo("Registered", "User created successfully")
+                popup.destroy()
+            except sqlite3.IntegrityError:
+                messagebox.showerror("Error", "Username already exists")
+            except Exception as e:
+                messagebox.showerror("Error", str(e))
+
+        ttk.Button(frm, text="Register", command=submit).pack(pady=12)
+
+    def handle_login(self):
+        u = self.login_username.get().strip()
+        p = self.login_password.get().strip()
+        if not u or not p:
+            messagebox.showwarning("Validation", "Enter username and password")
+            return
+        auth = authenticate(self.conn, u, p)
+        if not auth:
+            messagebox.showerror("Login failed", "Invalid credentials")
+            return
+        # role check: admin vs user
+        if self.login_role.get() == 'admin' and not auth['is_admin']:
+            messagebox.showerror("Access denied", "This user is not admin")
+            return
+        self.user = auth
+        self.create_main_ui()
+
+    def create_main_ui(self):
+        for w in self.root.winfo_children():
+            w.destroy()
+        topbar = ttk.Frame(self.root)
+        topbar.pack(fill='x')
+        ttk.Label(topbar, text=f"Logged in: {self.user['username']} {'(Admin)' if self.user['is_admin'] else ''}", font=("Helvetica", 11)).pack(side='left', padx=10, pady=8)
+        ttk.Button(topbar, text="Logout", command=self.logout).pack(side='right', padx=10)
+
+        # Notebook
+        self.nb = ttk.Notebook(self.root)
+        self.nb.pack(fill='both', expand=True, padx=8, pady=8)
+
+        # Tabs depend on admin/user role
+        if self.user['is_admin']:
+            self.tab_trains = ttk.Frame(self.nb)
+            self.tab_coaches = ttk.Frame(self.nb)
+            self.tab_stations = ttk.Frame(self.nb)
+            self.tab_passengers = ttk.Frame(self.nb)
+            self.tab_bookings = ttk.Frame(self.nb)
+            self.tab_reports = ttk.Frame(self.nb)
+
+            self.nb.add(self.tab_trains, text='Trains')
+            self.nb.add(self.tab_coaches, text='Coaches')
+            self.nb.add(self.tab_stations, text='Stations')
+            self.nb.add(self.tab_passengers, text='Passengers')
+            self.nb.add(self.tab_bookings, text='Bookings')
+            self.nb.add(self.tab_reports, text='Reports')
+
+            self.build_trains_tab()
+            self.build_coaches_tab()
+            self.build_stations_tab()
+            self.build_passengers_tab()
+            self.build_bookings_tab()
+            self.build_reports_tab()
+        else:
+            # user: can search trains, book tickets, view bookings
+            self.tab_search = ttk.Frame(self.nb)
+            self.tab_mybookings = ttk.Frame(self.nb)
+            self.nb.add(self.tab_search, text='Search & Book')
+            self.nb.add(self.tab_mybookings, text='My Bookings')
+            self.build_user_search_tab()
+            self.build_user_bookings_tab()
+
+    def logout(self):
+        self.user = None
+        self.create_login_screen()
+
+    # ---------------- Admin tabs ----------------
+    def build_stations_tab(self):
+        frm = self.tab_stations
+        top = ttk.Frame(frm)
+        top.pack(fill='x', pady=4)
+        ttk.Button(top, text="Add Station", command=self.open_add_station).pack(side='left', padx=4)
+        ttk.Button(top, text="Edit Selected", command=self.open_edit_station).pack(side='left', padx=4)
+        ttk.Button(top, text="Delete Selected", command=self.delete_selected_station).pack(side='left', padx=4)
+        search_var = tk.StringVar()
+        ttk.Entry(top, textvariable=search_var).pack(side='right', padx=6)
+        ttk.Label(top, text="Search:").pack(side='right')
+        search_var.trace_add('write', lambda *a: self.load_stations(search_var.get()))
+
+        cols = ("id", "code", "name")
+        self.sta_tree = ttk.Treeview(frm, columns=cols, show='headings')
+        for c in cols:
+            self.sta_tree.heading(c, text=c.title())
+            self.sta_tree.column(c, width=120, anchor='center')
+        vsb = ttk.Scrollbar(frm, orient='vertical', command=self.sta_tree.yview)
+        self.sta_tree.configure(yscroll=vsb.set)
+        self.sta_tree.pack(fill='both', expand=True, side='left')
+        vsb.pack(side='left', fill='y')
+        self.load_stations()
+
+    def load_stations(self, filter_text=None):
+        for i in self.sta_tree.get_children():
+            self.sta_tree.delete(i)
+        rows = fetch_stations(self.conn, filter_text)
+        for r in rows:
+            self.sta_tree.insert('', 'end', values=r)
+
+    def open_add_station(self):
+        popup = tk.Toplevel(self.root)
+        popup.title("Add Station")
+        popup.geometry("360x220")
+        frm = ttk.Frame(popup, padding=10)
+        frm.pack(fill='both', expand=True)
+        ttk.Label(frm, text="Code (UPPERCASE)").pack(anchor='w')
+        code = tk.StringVar()
+        ttk.Entry(frm, textvariable=code).pack(fill='x')
+        ttk.Label(frm, text="Name").pack(anchor='w', pady=(8,0))
+        name = tk.StringVar()
+        ttk.Entry(frm, textvariable=name).pack(fill='x')
+
+        def submit():
+            c = code.get().strip().upper()
+            n = name.get().strip()
+            if not c or not n:
+                messagebox.showwarning("Validation", "Code & name required")
+                return
+            if not valid_station_code(c):
+                messagebox.showwarning("Validation", "Station code must be 2-5 uppercase letters")
+                return
+            try:
+                add_station(self.conn, c, n)
+                messagebox.showinfo("Added", "Station added")
+                popup.destroy()
+                self.load_stations()
+            except sqlite3.IntegrityError:
+                messagebox.showerror("Error", "Station code already exists")
+            except Exception as e:
+                messagebox.showerror("Error", str(e))
+
+        ttk.Button(frm, text="Add", command=submit).pack(pady=10)
+
+    def open_edit_station(self):
+        sel = self.sta_tree.selection()
+        if not sel:
+            messagebox.showwarning("Select", "Please select a station")
+            return
+        data = self.sta_tree.item(sel[0])['values']
+        sid, code_old, name_old = data
+        popup = tk.Toplevel(self.root)
+        popup.title("Edit Station")
+        popup.geometry("360x220")
+        frm = ttk.Frame(popup, padding=10)
+        frm.pack(fill='both', expand=True)
+        ttk.Label(frm, text="Code (UPPERCASE)").pack(anchor='w')
+        code = tk.StringVar(value=code_old)
+        ttk.Entry(frm, textvariable=code).pack(fill='x')
+        ttk.Label(frm, text="Name").pack(anchor='w', pady=(8,0))
+        name = tk.StringVar(value=name_old)
+        ttk.Entry(frm, textvariable=name).pack(fill='x')
+
+        def submit():
+            c = code.get().strip().upper()
+            n = name.get().strip()
+            if not c or not n:
+                messagebox.showwarning("Validation", "Code & name required")
+                return
+            if not valid_station_code(c):
+                messagebox.showwarning("Validation", "Station code must be 2-5 uppercase letters")
+                return
+            try:
+                update_station(self.conn, sid, c, n)
+                messagebox.showinfo("Updated", "Station updated")
+                popup.destroy()
+                self.load_stations()
+            except sqlite3.IntegrityError:
+                messagebox.showerror("Error", "Station code already exists")
+            except Exception as e:
+                messagebox.showerror("Error", str(e))
+
+        ttk.Button(frm, text="Update", command=submit).pack(pady=10)
+
+    def delete_selected_station(self):
+        sel = self.sta_tree.selection()
+        if not sel:
+            messagebox.showwarning("Select", "Please select a station")
+            return
+        data = self.sta_tree.item(sel[0])['values']
+        sid = data[0]
+        if messagebox.askyesno("Confirm", "Delete station?"):
+            try:
+                delete_station(self.conn, sid)
+                messagebox.showinfo("Deleted", "Station deleted")
+                self.load_stations()
+            except Exception as e:
+                messagebox.showerror("Error", str(e))
+
+    # ---------------- Trains & Coaches ----------------
+    def build_trains_tab(self):
+        frm = self.tab_trains
+        top = ttk.Frame(frm)
+        top.pack(fill='x', pady=4)
+        ttk.Button(top, text="Add Train", command=self.open_add_train).pack(side='left', padx=4)
+        ttk.Button(top, text="Edit Selected", command=self.open_edit_train).pack(side='left', padx=4)
+        ttk.Button(top, text="Delete Selected", command=self.delete_selected_train).pack(side='left', padx=4)
+        ttk.Button(top, text="Refresh", command=self.load_trains).pack(side='left', padx=4)
+        search_var = tk.StringVar()
+        ttk.Entry(top, textvariable=search_var).pack(side='right', padx=6)
+        ttk.Label(top, text="Search:").pack(side='right')
+        search_var.trace_add('write', lambda *a: self.load_trains(search_var.get()))
+
+        cols = ("id", "train_number", "train_name", "stops_count", "created_at")
+        self.tr_tree = ttk.Treeview(frm, columns=cols, show='headings')
+        for c in cols:
+            self.tr_tree.heading(c, text=c.replace('_',' ').title())
+            self.tr_tree.column(c, width=150, anchor='center')
+        self.tr_tree.column('train_name', width=220)
+        vsb = ttk.Scrollbar(frm, orient='vertical', command=self.tr_tree.yview)
+        self.tr_tree.configure(yscroll=vsb.set)
+        self.tr_tree.pack(fill='both', expand=True, side='left')
+        vsb.pack(side='left', fill='y')
+        self.load_trains()
+
+    def load_trains(self, filter_text=None):
+        for i in self.tr_tree.get_children():
+            self.tr_tree.delete(i)
+        rows = fetch_trains(self.conn, filter_text)
+        for r in rows:
+            tid, tno, tname, route_json, created = r
+            stops = []
+            try:
+                stops = json.loads(route_json or "[]")
+            except Exception:
+                stops = []
+            self.tr_tree.insert('', 'end', values=(tid, tno, tname, len(stops), created))
+
+    def open_add_train(self):
+        self.open_train_form()
+
+    def open_edit_train(self):
+        sel = self.tr_tree.selection()
+        if not sel:
+            messagebox.showwarning("Select", "Please select a train")
+            return
+        data = self.tr_tree.item(sel[0])['values']
+        tid = data[0]
+        # fetch full train row
+        cur = self.conn.cursor()
+        cur.execute("SELECT id, train_number, train_name, route_json FROM trains WHERE id=?", (tid,))
+        row = cur.fetchone()
+        if row:
+            self.open_train_form(train_row=row)
+
+    def open_train_form(self, train_row=None):
+        popup = tk.Toplevel(self.root)
+        popup.title("Train Form")
+        popup.geometry("700x560")
+        frm = ttk.Frame(popup, padding=10)
+        frm.pack(fill='both', expand=True)
+
+        ttk.Label(frm, text="Train Number").grid(row=0, column=0, sticky='w')
+        train_number = tk.StringVar(value=train_row[1] if train_row else "")
+        ttk.Entry(frm, textvariable=train_number).grid(row=0, column=1, sticky='ew')
+
+        ttk.Label(frm, text="Train Name").grid(row=1, column=0, sticky='w', pady=(6,0))
+        train_name = tk.StringVar(value=train_row[2] if train_row else "")
+        ttk.Entry(frm, textvariable=train_name).grid(row=1, column=1, sticky='ew')
+
+        # Route editor: simple listbox of stops
+        ttk.Label(frm, text="Route Stops (StationCode | Arrival(YYYY-MM-DD HH:MM) | Departure(YYYY-MM-DD HH:MM) | Distance_km)").grid(row=2, column=0, columnspan=2, sticky='w', pady=(8,0))
+        route_listbox = tk.Listbox(frm, height=8)
+        route_listbox.grid(row=3, column=0, columnspan=2, sticky='nsew', pady=6)
+        route_items = []
+
+        def render_route():
+            route_listbox.delete(0, 'end')
+            for idx, s in enumerate(route_items, start=1):
+                arr = s.get('arrival','')
+                dep = s.get('departure','')
+                dist = s.get('distance','')
+                route_listbox.insert('end', f"{idx}. {s['station_code']} | Arr:{arr or '-'} | Dep:{dep or '-'} | D:{dist}")
+
+        # route form
+        ttk.Label(frm, text="Station Code").grid(row=4, column=0, sticky='w')
+        rc_code = tk.StringVar()
+        ttk.Entry(frm, textvariable=rc_code).grid(row=4, column=1, sticky='ew')
+
+        ttk.Label(frm, text="Arrival (ISO or empty)").grid(row=5, column=0, sticky='w')
+        rc_arr = tk.StringVar()
+        ttk.Entry(frm, textvariable=rc_arr).grid(row=5, column=1, sticky='ew')
+
+        ttk.Label(frm, text="Departure (ISO)").grid(row=6, column=0, sticky='w')
+        rc_dep = tk.StringVar()
+        ttk.Entry(frm, textvariable=rc_dep).grid(row=6, column=1, sticky='ew')
+
+        ttk.Label(frm, text="Distance from origin (km)").grid(row=7, column=0, sticky='w')
+        rc_dist = tk.StringVar()
+        ttk.Entry(frm, textvariable=rc_dist).grid(row=7, column=1, sticky='ew')
+
+        def add_stop():
+            code = rc_code.get().strip().upper()
+            arr = rc_arr.get().strip()
+            dep = rc_dep.get().strip()
+            dist = rc_dist.get().strip()
+            if not code:
+                messagebox.showwarning("Validation", "Station code required")
+                return
+            if arr:
+                try:
+                    _ = datetime.strptime(arr, "%Y-%m-%d %H:%M")
+                except Exception:
+                    messagebox.showwarning("Validation", "Arrival must be in YYYY-MM-DD HH:MM")
+                    return
+            if dep:
+                try:
+                    _ = datetime.strptime(dep, "%Y-%m-%d %H:%M")
+                except Exception:
+                    messagebox.showwarning("Validation", "Departure must be in YYYY-MM-DD HH:MM")
+                    return
+            try:
+                distf = float(dist) if dist else 0.0
+            except:
+                messagebox.showwarning("Validation", "Distance must be numeric")
+                return
+            route_items.append({"station_code": code, "arrival": arr, "departure": dep, "distance": distf})
+            render_route()
+
+        def remove_stop():
+            sel = route_listbox.curselection()
+            if not sel:
+                return
+            idx = sel[0]
+            route_items.pop(idx)
+            render_route()
+
+        ttk.Button(frm, text="Add Stop", command=add_stop).grid(row=8, column=0, pady=6)
+        ttk.Button(frm, text="Remove Selected Stop", command=remove_stop).grid(row=8, column=1, pady=6)
+
+        # fill existing route if editing
+        if train_row:
+            try:
+                ro = json.loads(train_row[3] or "[]")
+                route_items = ro.copy()
+                render_route()
+            except Exception:
+                route_items = []
+
+        # Submit
+        def submit():
+            tno = train_number.get().strip()
+            tname = train_name.get().strip()
+            if not tno or not tname:
+                messagebox.showwarning("Validation", "Train number & name required")
+                return
+            if not valid_train_number(tno):
+                messagebox.showwarning("Validation", "Invalid train number")
+                return
+            # ensure at least 2 stops
+            if len(route_items) < 2:
+                messagebox.showwarning("Validation", "Add at least 2 stops for a route")
+                return
+            # Validate times are in future for departure of first stop maybe; we'll ensure departure times are ISO
+            # convert departure strings to isoformat with timezone
+            for s in route_items:
+                if s.get('departure'):
+                    try:
+                        dt = datetime.strptime(s['departure'], "%Y-%m-%d %H:%M")
+                        # store as ISO with IST tz
+                        s['departure'] = dt.replace(tzinfo=IST).isoformat()
+                    except Exception:
+                        messagebox.showwarning("Validation", f"Departure time invalid for {s['station_code']}")
+                        return
+                if s.get('arrival'):
+                    try:
+                        dt = datetime.strptime(s['arrival'], "%Y-%m-%d %H:%M")
+                        s['arrival'] = dt.replace(tzinfo=IST).isoformat()
+                    except Exception:
+                        # allow empty arrival
+                        pass
+                # distance keep as float
+                s['distance'] = float(s.get('distance', 0) or 0)
+            try:
+                if train_row:
+                    update_train(self.conn, train_row[0], tno, tname, route_items)
+                    messagebox.showinfo("Updated", "Train updated")
+                else:
+                    add_train(self.conn, tno, tname, route_items)
+                    messagebox.showinfo("Added", "Train added")
+                popup.destroy()
+                self.load_trains()
+            except sqlite3.IntegrityError:
+                messagebox.showerror("Error", "Train number must be unique")
+            except Exception as e:
+                messagebox.showerror("Error", str(e))
+
+        ttk.Button(frm, text="Save Train", command=submit).grid(row=9, column=0, columnspan=2, pady=8)
+        # let grid expand nicely
+        frm.columnconfigure(1, weight=1)
+        frm.rowconfigure(3, weight=1)
+
+    def delete_selected_train(self):
+        sel = self.tr_tree.selection()
+        if not sel:
+            messagebox.showwarning("Select", "Please select a train")
+            return
+        data = self.tr_tree.item(sel[0])['values']
+        tid = data[0]
+        if messagebox.askyesno("Confirm", "Delete train and everything related?"):
+            try:
+                delete_train(self.conn, tid)
+                messagebox.showinfo("Deleted", "Train deleted")
+                self.load_trains()
+            except Exception as e:
+                messagebox.showerror("Error", str(e))
+
+    # Coaches tab
+    def build_coaches_tab(self):
+        frm = self.tab_coaches
+        top = ttk.Frame(frm)
+        top.pack(fill='x', pady=4)
+        ttk.Button(top, text="Add Coach to Train", command=self.open_add_coach).pack(side='left', padx=4)
+        ttk.Button(top, text="Edit Selected", command=self.open_edit_coach).pack(side='left', padx=4)
+        ttk.Button(top, text="Delete Selected", command=self.delete_selected_coach).pack(side='left', padx=4)
+        ttk.Button(top, text="Refresh", command=self.load_coaches).pack(side='left', padx=4)
+        ttk.Label(top, text="Filter Train:").pack(side='left', padx=(12,4))
+        self.coach_filter = tk.StringVar()
+        ttk.Entry(top, textvariable=self.coach_filter).pack(side='left', padx=4)
+        ttk.Button(top, text="Load", command=lambda: self.load_coaches(self.coach_filter.get())).pack(side='left')
+
+        cols = ("id", "train_id", "train_number", "class", "coach_label", "seat_count", "fare", "available")
+        self.coach_tree = ttk.Treeview(frm, columns=cols, show='headings')
+        for c in cols:
+            self.coach_tree.heading(c, text=c.replace('_',' ').title())
+            self.coach_tree.column(c, width=120, anchor='center')
+        self.coach_tree.column('train_number', width=160)
+        vsb = ttk.Scrollbar(frm, orient='vertical', command=self.coach_tree.yview)
+        self.coach_tree.configure(yscroll=vsb.set)
+        self.coach_tree.pack(fill='both', expand=True, side='left')
+        vsb.pack(side='left', fill='y')
+        self.load_coaches()
+
+    def load_coaches(self, train_filter=None):
+        for i in self.coach_tree.get_children():
+            self.coach_tree.delete(i)
+        cur = self.conn.cursor()
+        if train_filter:
+            like = f"%{train_filter}%"
+            cur.execute('''
+            SELECT c.id, c.train_id, t.train_number, c.class, c.coach_label, c.seat_count, c.fare, c.seats_json
+            FROM train_coaches c JOIN trains t ON c.train_id=t.id
+            WHERE t.train_number LIKE ? OR t.train_name LIKE ?
+            ORDER BY c.id
+            ''', (like, like))
+        else:
+            cur.execute('''
+            SELECT c.id, c.train_id, t.train_number, c.class, c.coach_label, c.seat_count, c.fare, c.seats_json
+            FROM train_coaches c JOIN trains t ON c.train_id=t.id
+            ORDER BY c.id
+            ''')
+        rows = cur.fetchall()
+        for r in rows:
+            cid, tid, tno, cls, label, seats_count, fare, seats_json = r
+            # compute availability
+            try:
+                seats = json.loads(seats_json or "{}")
+                free = sum(1 for v in seats.values() if v == "FREE")
+            except Exception:
+                free = seats_count
+            self.coach_tree.insert('', 'end', values=(cid, tid, tno, cls, label, seats_count, fare, free))
+
+    def open_add_coach(self):
+        popup = tk.Toplevel(self.root)
+        popup.title("Add Coach")
+        popup.geometry("420x320")
+        frm = ttk.Frame(popup, padding=10)
+        frm.pack(fill='both', expand=True)
+
+        ttk.Label(frm, text="Select Train").pack(anchor='w')
+        trains = fetch_trains(self.conn)
+        train_map = {f"{t[1]} - {t[2]}": t for t in trains}  # "number - name" -> row
+        train_var = tk.StringVar()
+        ttk.Combobox(frm, values=list(train_map.keys()), textvariable=train_var).pack(fill='x')
+
+        ttk.Label(frm, text="Class (SL/3A/2A/1A)").pack(anchor='w', pady=(8,0))
+        cls = tk.StringVar(value="SL")
+        ttk.Combobox(frm, values=["SL","3A","2A","1A"], textvariable=cls).pack(fill='x')
+
+        ttk.Label(frm, text="Coach Label (S1, B1, A1 etc.)").pack(anchor='w', pady=(8,0))
+        label = tk.StringVar()
+        ttk.Entry(frm, textvariable=label).pack(fill='x')
+
+        ttk.Label(frm, text="Seat Count").pack(anchor='w', pady=(8,0))
+        seats = tk.StringVar(value="24")
+        ttk.Entry(frm, textvariable=seats).pack(fill='x')
+
+        ttk.Label(frm, text="Fare per seat (INR)").pack(anchor='w', pady=(8,0))
+        fare = tk.StringVar(value="200")
+        ttk.Entry(frm, textvariable=fare).pack(fill='x')
+
+        def submit():
+            sel = train_var.get().strip()
+            if not sel:
+                messagebox.showwarning("Validation", "Select train")
+                return
+            train_row = train_map.get(sel)
+            t_id = train_row[0]
+            cl = cls.get().strip()
+            lab = label.get().strip().upper()
+            try:
+                sc = int(seats.get().strip())
+                ff = float(fare.get().strip())
+            except Exception:
+                messagebox.showwarning("Validation", "Seat count/fare invalid")
+                return
+            if not lab:
+                messagebox.showwarning("Validation", "Coach label required")
+                return
+            try:
+                add_coach(self.conn, t_id, cl, lab, sc, ff)
+                messagebox.showinfo("Added", "Coach added")
+                popup.destroy()
+                self.load_coaches()
+            except Exception as e:
+                messagebox.showerror("Error", str(e))
+
+        ttk.Button(frm, text="Add Coach", command=submit).pack(pady=12)
+
+    def open_edit_coach(self):
+        sel = self.coach_tree.selection()
+        if not sel:
+            messagebox.showwarning("Select", "Select coach")
+            return
+        data = self.coach_tree.item(sel[0])['values']
+        coach_id = data[0]
+        cur = self.conn.cursor()
+        cur.execute("SELECT id, train_id, class, coach_label, seat_count, fare FROM train_coaches WHERE id=?", (coach_id,))
+        row = cur.fetchone()
+        if not row:
+            return
+        popup = tk.Toplevel(self.root)
+        popup.title("Edit Coach")
+        popup.geometry("420x320")
+        frm = ttk.Frame(popup, padding=10)
+        frm.pack(fill='both', expand=True)
+
+        ttk.Label(frm, text="Class").pack(anchor='w')
+        cls = tk.StringVar(value=row[2])
+        ttk.Entry(frm, textvariable=cls).pack(fill='x')
+        ttk.Label(frm, text="Coach Label").pack(anchor='w', pady=(8,0))
+        lab = tk.StringVar(value=row[3])
+        ttk.Entry(frm, textvariable=lab).pack(fill='x')
+        ttk.Label(frm, text="Seat Count").pack(anchor='w', pady=(8,0))
+        seats = tk.StringVar(value=str(row[4]))
+        ttk.Entry(frm, textvariable=seats).pack(fill='x')
+        ttk.Label(frm, text="Fare").pack(anchor='w', pady=(8,0))
+        fare = tk.StringVar(value=str(row[5]))
+        ttk.Entry(frm, textvariable=fare).pack(fill='x')
+
+        def submit():
+            try:
+                sc = int(seats.get().strip())
+                ff = float(fare.get().strip())
+            except:
+                messagebox.showwarning("Validation", "Seat/fare invalid")
+                return
+            try:
+                update_coach(self.conn, coach_id, cls.get().strip(), lab.get().strip().upper(), sc, ff)
+                messagebox.showinfo("Updated", "Coach updated")
+                popup.destroy()
+                self.load_coaches()
+            except Exception as e:
+                messagebox.showerror("Error", str(e))
+
+        ttk.Button(frm, text="Update", command=submit).pack(pady=8)
+
+    def delete_selected_coach(self):
+        sel = self.coach_tree.selection()
+        if not sel:
+            messagebox.showwarning("Select", "Select coach")
+            return
+        data = self.coach_tree.item(sel[0])['values']
+        coach_id = data[0]
+        if messagebox.askyesno("Confirm", "Delete coach? This will remove bookings for this coach."):
+            try:
+                delete_coach(self.conn, coach_id)
+                messagebox.showinfo("Deleted", "Coach deleted")
+                self.load_coaches()
+            except Exception as e:
+                messagebox.showerror("Error", str(e))
+
+    # Passengers tab
+    def build_passengers_tab(self):
+        frm = self.tab_passengers
+        top = ttk.Frame(frm)
+        top.pack(fill='x', pady=4)
+        ttk.Button(top, text="Add Passenger", command=self.open_add_passenger).pack(side='left', padx=4)
+        ttk.Button(top, text="Edit Selected", command=self.open_edit_passenger).pack(side='left', padx=4)
+        ttk.Button(top, text="Delete Selected", command=self.delete_selected_passenger).pack(side='left', padx=4)
+        ttk.Button(top, text="Refresh", command=self.load_passengers).pack(side='left', padx=4)
+        search_var = tk.StringVar()
+        ttk.Entry(top, textvariable=search_var).pack(side='right', padx=6)
+        ttk.Label(top, text="Search:").pack(side='right')
+        search_var.trace_add('write', lambda *a: self.load_passengers(search_var.get()))
+
+        cols = ("id", "name", "email", "phone")
+        self.pax_tree = ttk.Treeview(frm, columns=cols, show='headings')
+        for c in cols:
+            self.pax_tree.heading(c, text=c.title())
+            self.pax_tree.column(c, width=150, anchor='center')
+        vsb = ttk.Scrollbar(frm, orient='vertical', command=self.pax_tree.yview)
+        self.pax_tree.configure(yscroll=vsb.set)
+        self.pax_tree.pack(fill='both', expand=True, side='left')
+        vsb.pack(side='left', fill='y')
+        self.load_passengers()
+
+    def load_passengers(self, filter_text=None):
+        for i in self.pax_tree.get_children():
+            self.pax_tree.delete(i)
+        rows = fetch_passengers(self.conn, filter_text)
+        for r in rows:
+            self.pax_tree.insert('', 'end', values=r)
+
+    def open_add_passenger(self):
+        popup = tk.Toplevel(self.root)
+        popup.title("Add Passenger")
+        popup.geometry("360x260")
+        frm = ttk.Frame(popup, padding=10)
+        frm.pack(fill='both', expand=True)
+        ttk.Label(frm, text="Name").pack(anchor='w')
+        name = tk.StringVar()
+        ttk.Entry(frm, textvariable=name).pack(fill='x')
+        ttk.Label(frm, text="Email").pack(anchor='w', pady=(8,0))
+        email = tk.StringVar()
+        ttk.Entry(frm, textvariable=email).pack(fill='x')
+        ttk.Label(frm, text="Phone").pack(anchor='w', pady=(8,0))
+        phone = tk.StringVar()
+        ttk.Entry(frm, textvariable=phone).pack(fill='x')
+
+        def submit():
+            n = name.get().strip()
+            em = email.get().strip()
+            ph = phone.get().strip()
+            if not n:
+                messagebox.showwarning("Validation", "Name required")
+                return
+            if em and not valid_email(em):
+                messagebox.showwarning("Validation", "Invalid email")
+                return
+            if ph and not valid_phone(ph):
+                messagebox.showwarning("Validation", "Invalid phone")
+                return
+            try:
+                add_passenger(self.conn, n, em, ph)
+                messagebox.showinfo("Added", "Passenger added")
+                popup.destroy()
+                self.load_passengers()
+            except Exception as e:
+                messagebox.showerror("Error", str(e))
+
+        ttk.Button(frm, text="Add", command=submit).pack(pady=8)
+
+    def open_edit_passenger(self):
+        sel = self.pax_tree.selection()
+        if not sel:
+            messagebox.showwarning("Select", "Select passenger")
+            return
+        data = self.pax_tree.item(sel[0])['values']
+        pid, name_old, email_old, phone_old = data
+        popup = tk.Toplevel(self.root)
+        popup.title("Edit Passenger")
+        popup.geometry("360x260")
+        frm = ttk.Frame(popup, padding=10)
+        frm.pack(fill='both', expand=True)
+        ttk.Label(frm, text="Name").pack(anchor='w')
+        name = tk.StringVar(value=name_old)
+        ttk.Entry(frm, textvariable=name).pack(fill='x')
+        ttk.Label(frm, text="Email").pack(anchor='w', pady=(8,0))
+        email = tk.StringVar(value=email_old)
+        ttk.Entry(frm, textvariable=email).pack(fill='x')
+        ttk.Label(frm, text="Phone").pack(anchor='w', pady=(8,0))
+        phone = tk.StringVar(value=phone_old)
+        ttk.Entry(frm, textvariable=phone).pack(fill='x')
+
+        def submit():
+            n = name.get().strip()
+            em = email.get().strip()
+            ph = phone.get().strip()
+            if not n:
+                messagebox.showwarning("Validation", "Name required")
+                return
+            if em and not valid_email(em):
+                messagebox.showwarning("Validation", "Invalid email")
+                return
+            if ph and not valid_phone(ph):
+                messagebox.showwarning("Validation", "Invalid phone")
+                return
+            try:
+                update_passenger(self.conn, pid, n, em, ph)
+                messagebox.showinfo("Updated", "Passenger updated")
+                popup.destroy()
+                self.load_passengers()
+            except Exception as e:
+                messagebox.showerror("Error", str(e))
+
+        ttk.Button(frm, text="Update", command=submit).pack(pady=8)
+
+    def delete_selected_passenger(self):
+        sel = self.pax_tree.selection()
+        if not sel:
+            messagebox.showwarning("Select", "Select passenger")
+            return
+        data = self.pax_tree.item(sel[0])['values']
+        pid = data[0]
+        if messagebox.askyesno("Confirm", "Delete passenger and related bookings?"):
+            try:
+                delete_passenger(self.conn, pid)
+                messagebox.showinfo("Deleted", "Passenger deleted")
+                self.load_passengers()
+            except Exception as e:
+                messagebox.showerror("Error", str(e))
+
+    # Bookings tab (admin)
+    def build_bookings_tab(self):
+        frm = self.tab_bookings
+        top = ttk.Frame(frm)
+        top.pack(fill='x', pady=4)
+        ttk.Button(top, text="Book Ticket", command=self.open_admin_book_ticket).pack(side='left', padx=4)
+        ttk.Button(top, text="Cancel Selected", command=self.admin_cancel_booking).pack(side='left', padx=4)
+        ttk.Button(top, text="Export Bookings CSV", command=self.export_all_bookings).pack(side='left', padx=4)
+        ttk.Button(top, text="Print Ticket for Selected", command=self.admin_print_ticket).pack(side='left', padx=4)
+        ttk.Button(top, text="Refresh", command=self.load_bookings).pack(side='left', padx=4)
+        search_var = tk.StringVar()
+        ttk.Entry(top, textvariable=search_var).pack(side='right', padx=6)
+        ttk.Label(top, text="Search:").pack(side='right')
+        search_var.trace_add('write', lambda *a: self.load_bookings(search_var.get()))
+
+        cols = ("id", "pnr", "train_number", "train_name", "coach", "seat", "passenger", "booking_time", "status", "fare", "departure")
+        self.booking_tree = ttk.Treeview(frm, columns=cols, show='headings')
+        for c in cols:
+            self.booking_tree.heading(c, text=c.replace('_',' ').title())
+            self.booking_tree.column(c, width=120, anchor='center')
+        self.booking_tree.column('train_name', width=180)
+        self.booking_tree.column('passenger', width=160)
+        vsb = ttk.Scrollbar(frm, orient='vertical', command=self.booking_tree.yview)
+        self.booking_tree.configure(yscroll=vsb.set)
+        self.booking_tree.pack(fill='both', expand=True, side='left')
+        vsb.pack(side='left', fill='y')
+        self.load_bookings()
+
+    def load_bookings(self, filter_text=None):
+        for i in self.booking_tree.get_children():
+            self.booking_tree.delete(i)
+        rows = fetch_bookings(self.conn, filter_text)
+        for r in rows:
+            # id, pnr, tno, tname, coach_label, seat_no, passenger_name, booking_time, status, fare_paid, departure_time, user_id
+            self.booking_tree.insert('', 'end', values=(r[0], r[1], r[2], r[3], r[4], r[5], r[6], format_dt(r[7]), r[8], r[9], format_dt(r[10])))
+
+    def open_admin_book_ticket(self):
+        popup = tk.Toplevel(self.root)
+        popup.title("Book Ticket (Admin)")
+        popup.geometry("680x520")
+        frm = ttk.Frame(popup, padding=10)
+        frm.pack(fill='both', expand=True)
+
+        # Select train
+        ttk.Label(frm, text="Select Train").pack(anchor='w')
+        trains = fetch_trains(self.conn)
+        train_map = {f"{t[1]} - {t[2]}": t for t in trains}
+        train_var = tk.StringVar()
+        ttk.Combobox(frm, values=list(train_map.keys()), textvariable=train_var).pack(fill='x')
+
+        # On train select, load coaches
+        ttk.Label(frm, text="Select Coach").pack(anchor='w', pady=(8,0))
+        coach_var = tk.StringVar()
+        coach_combo = ttk.Combobox(frm, values=[], textvariable=coach_var)
+        coach_combo.pack(fill='x')
+
+        def on_train_change(*a):
+            sel = train_var.get()
+            if not sel: return
+            tr = train_map.get(sel)
+            coaches = fetch_coaches_for_train(self.conn, tr[0])
+            coach_map = {f"{c[2]} ({c[1]} seats, {c[0]} fare maybe?)": c for c in [(co[0], co[3], co[1], co[4]) for co in coaches]}
+            # simplified mapping for display
+            display = []
+            mapping = {}
+            for co in coaches:
+                cid, cls, label, scount, fare, seats_json = co
+                key = f"{label} - {cls} - {scount} seats - INR {fare}"
+                display.append(key)
+                mapping[key] = co
+            coach_combo['values'] = display
+            coach_combo._map = mapping
+
+        train_var.trace_add('write', on_train_change)
+
+        # Passenger selection
+        ttk.Label(frm, text="Passenger").pack(anchor='w', pady=(8,0))
+        passengers = fetch_passengers(self.conn)
+        pax_map = {f"{p[0]} - {p[1]}": p for p in passengers}
+        pax_var = tk.StringVar()
+        ttk.Combobox(frm, values=list(pax_map.keys()), textvariable=pax_var).pack(fill='x')
+        ttk.Label(frm, text="(If passenger not present, add in Passengers tab)").pack(anchor='w')
+
+        # Seat selection
+        ttk.Label(frm, text="Select Seat No (will populate after coach selected)").pack(anchor='w', pady=(8,0))
+        seat_var = tk.StringVar()
+        seat_combo = ttk.Combobox(frm, values=[], textvariable=seat_var)
+        seat_combo.pack(fill='x')
+
+        def on_coach_change(*a):
+            v = coach_var.get()
+            mapping = getattr(coach_combo, '_map', {})
+            co = mapping.get(v)
+            if not co:
+                seat_combo['values'] = []
+                return
+            cid, cls, label, scount, fare, seats_json = co
+            try:
+                seats = json.loads(seats_json or "{}")
+            except:
+                seats = {}
+            free_seats = [k for k, val in seats.items() if val == "FREE"]
+            seat_combo['values'] = free_seats
+
+        coach_var.trace_add('write', on_coach_change)
+
+        # Payment method
+        ttk.Label(frm, text="Payment Method").pack(anchor='w', pady=(8,0))
+        pay_method = tk.StringVar(value="Cash")
+        ttk.Combobox(frm, values=["Cash","UPI","Card"], textvariable=pay_method).pack(fill='x')
+
+        def submit():
+            trsel = train_var.get()
+            csel = coach_var.get()
+            psel = pax_var.get()
+            selseat = seat_var.get()
+            pay = pay_method.get()
+            if not trsel or not csel or not psel or not selseat:
+                messagebox.showwarning("Select", "Select train, coach, passenger and seat")
+                return
+            tr = train_map.get(trsel)
+            # find coach object
+            mapping = getattr(coach_combo, '_map', {})
+            co = mapping.get(csel)
+            if not co:
+                messagebox.showerror("Error", "Coach selection invalid")
+                return
+            cid, cls, label, scount, fare, seats_json = co
+            pax = pax_map.get(psel)
+            # departure: use earliest departure in train route
+            try:
+                cur = self.conn.cursor()
+                cur.execute("SELECT route_json FROM trains WHERE id=?", (tr[0],))
+                rr = cur.fetchone()
+                route = json.loads(rr[0] or "[]")
+                # pick first stop departure as train departure (approx)
+                dep = None
+                for s in route:
+                    if s.get('departure'):
+                        dep = s['departure']
+                        break
+                if not dep:
+                    messagebox.showwarning("No departure", "Train has no departure times set")
+                    return
+            except Exception:
+                messagebox.showerror("Error", "Unable to determine departure time")
+                return
+            # ensure departure is future
+            depdt = datetime.fromisoformat(dep).astimezone(IST)
+            if depdt <= now_ist():
+                messagebox.showwarning("Time", "Train departure is not in future")
+                return
+            # book seat
+            try:
+                bid, pnr = book_seat(self.conn, tr[0], cid, selseat, pax[0], cls, float(fare), dep, self.user['id'])
+                # record payment
+                record_payment(self.conn, bid, pay, float(fare))
+                messagebox.showinfo("Booked", f"Booking successful. Booking ID: {bid} PNR: {pnr}")
+                popup.destroy()
+                self.load_bookings()
+                self.load_coaches()
+            except Exception as e:
+                messagebox.showerror("Booking error", str(e))
+
+        ttk.Button(frm, text="Book Now", command=submit).pack(pady=12)
+        # preview instructions
+        ttk.Label(frm, text="Tip: ensure train has future departure times.").pack(anchor='w', pady=(8,0))
+
+    def admin_cancel_booking(self):
+        sel = self.booking_tree.selection()
+        if not sel:
+            messagebox.showwarning("Select", "Select booking")
+            return
+        data = self.booking_tree.item(sel[0])['values']
+        booking_id = data[0]
+        if messagebox.askyesno("Confirm", "Cancel this booking?"):
+            try:
+                refund = cancel_booking(self.conn, booking_id)
+                messagebox.showinfo("Cancelled", f"Booking cancelled. Refund: INR {refund:.2f}")
+                self.load_bookings()
+                self.load_coaches()
+            except Exception as e:
+                messagebox.showerror("Error", str(e))
+
+    def admin_print_ticket(self):
+        sel = self.booking_tree.selection()
+        if not sel:
+            messagebox.showwarning("Select", "Select booking to print")
+            return
+        data = self.booking_tree.item(sel[0])['values']
+        booking_id = data[0]
+        cur = self.conn.cursor()
+        cur.execute("SELECT pnr, train_id, coach_id, seat_no, passenger_id, travel_class, booking_time, status, fare_paid, departure_time FROM bookings WHERE id=?", (booking_id,))
+        row = cur.fetchone()
+        if not row:
+            messagebox.showerror("Error", "Booking not found")
+            return
+        pnr, train_id, coach_id, seat_no, passenger_id, travel_class, booking_time, status, fare_paid, departure_time = row
+        # gather data
+        cur.execute("SELECT train_number, train_name FROM trains WHERE id=?", (train_id,))
+        tr = cur.fetchone()
+        cur.execute("SELECT coach_label FROM train_coaches WHERE id=?", (coach_id,))
+        co = cur.fetchone()
+        cur.execute("SELECT name, email, phone FROM passengers WHERE id=?", (passenger_id,))
+        pa = cur.fetchone()
+        booking_info = {"pnr": pnr, "travel_class": travel_class, "seat_no": seat_no, "booking_time": booking_time, "status": status, "fare_paid": fare_paid, "departure_time": departure_time}
+        train_info = {"train_number": tr[0], "train_name": tr[1]}
+        coach_info = {"coach_label": co[0]}
+        passenger_info = {"name": pa[0], "email": pa[1], "phone": pa[2]}
+
+        # ask save location
+        fn = filedialog.asksaveasfilename(defaultextension='.txt', initialfile=f"{pnr}.txt", filetypes=[("Text files","*.txt"),("PDF files","*.pdf")])
+        if not fn: return
+        if fn.lower().endswith('.pdf'):
+            ok, err = save_ticket_pdf(fn, booking_info, passenger_info, train_info, coach_info)
+            if ok:
+                messagebox.showinfo("Saved", f"Ticket saved to {fn}")
+            else:
+                messagebox.showerror("PDF Error", f"Could not save PDF: {err}")
+        else:
+            ok = save_ticket_text(fn, booking_info, passenger_info, train_info, coach_info)
+            if ok:
+                messagebox.showinfo("Saved", f"Ticket saved to {fn}")
+            else:
+                messagebox.showerror("Error", "Failed to save ticket")
+
+    # Reports
+    def build_reports_tab(self):
+        frm = self.tab_reports
+        top = ttk.Frame(frm)
+        top.pack(fill='x', pady=4)
+        ttk.Button(top, text="Export Trains CSV", command=self.export_all_trains).pack(side='left', padx=4)
+        ttk.Button(top, text="Export Coaches CSV", command=self.export_all_coaches).pack(side='left', padx=4)
+        ttk.Button(top, text="Export Bookings CSV", command=self.export_all_bookings).pack(side='left', padx=4)
+        ttk.Label(top, text="Generate daily report by date (YYYY-MM-DD):").pack(side='left', padx=8)
+        self.report_date = tk.StringVar(value=now_ist().strftime("%Y-%m-%d"))
+        ttk.Entry(top, textvariable=self.report_date, width=12).pack(side='left')
+        ttk.Button(top, text="Generate", command=self.generate_daily_report).pack(side='left', padx=6)
+
+        self.report_text = tk.Text(frm)
+        self.report_text.pack(fill='both', expand=True, padx=6, pady=6)
+
+    def export_all_trains(self):
+        rows = []
+        for t in fetch_trains(self.conn):
+            rid, tno, tname, route_json, created = t
+            rows.append((rid, tno, tname, route_json or "", created))
+        path = export_to_csv(rows, ["id","train_number","train_name","route_json","created_at"], default_name="trains.csv")
+        if path:
+            messagebox.showinfo("Exported", f"Trains exported to {path}")
+
+    def export_all_coaches(self):
+        cur = self.conn.cursor()
+        cur.execute("SELECT id, train_id, class, coach_label, seat_count, fare, seats_json FROM train_coaches ORDER BY id")
+        rows = cur.fetchall()
+        path = export_to_csv(rows, ["id","train_id","class","coach_label","seat_count","fare","seats_json"], default_name="coaches.csv")
+        if path:
+            messagebox.showinfo("Exported", f"Coaches exported to {path}")
+
+    def export_all_bookings(self):
+        rows = fetch_bookings(self.conn)
+        # flatten
+        flat = []
+        for r in rows:
+            flat.append((r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10]))
+        path = export_to_csv(flat, ["id","pnr","train_number","train_name","coach_label","seat_no","passenger_name","booking_time","status","fare_paid","departure_time"], default_name="bookings.csv")
+        if path:
+            messagebox.showinfo("Exported", f"Bookings exported to {path}")
+
+    def generate_daily_report(self):
+        dstr = self.report_date.get().strip()
+        try:
+            d = datetime.strptime(dstr, "%Y-%m-%d")
+        except:
+            messagebox.showwarning("Validation", "Date must be YYYY-MM-DD")
+            return
+        start = d.replace(tzinfo=IST)
+        end = (d + timedelta(days=1)).replace(tzinfo=IST)
+        cur = self.conn.cursor()
+        cur.execute("SELECT b.id, b.pnr, t.train_number, t.train_name, p.name, b.fare_paid, b.booking_time, b.status FROM bookings b JOIN trains t ON b.train_id=t.id JOIN passengers p ON b.passenger_id=p.id WHERE b.booking_time BETWEEN ? AND ? ORDER BY b.id", (start.isoformat(), end.isoformat()))
+        rows = cur.fetchall()
+        total = sum(r[5] for r in rows)
+        out = f"Report for {dstr}\nTotal bookings: {len(rows)}  Total fare: INR {total:.2f}\n\n"
+        for r in rows:
+            out += f"ID:{r[0]} PNR:{r[1]} Train:{r[2]} - {r[3]} Passenger:{r[4]} Fare:{r[5]} Time:{format_dt(r[6])} Status:{r[7]}\n"
+        self.report_text.delete('1.0', 'end')
+        self.report_text.insert('end', out)
+
+    # ---------------- User tabs ----------------
+    def build_user_search_tab(self):
+        frm = self.tab_search
+        top = ttk.Frame(frm)
+        top.pack(fill='x', pady=4)
+        ttk.Label(top, text="From Station Code").pack(side='left', padx=(6,2))
+        self.user_from = tk.StringVar()
+        ttk.Entry(top, textvariable=self.user_from, width=10).pack(side='left', padx=4)
+        ttk.Label(top, text="To Station Code").pack(side='left', padx=(6,2))
+        self.user_to = tk.StringVar()
+        ttk.Entry(top, textvariable=self.user_to, width=10).pack(side='left', padx=4)
+        ttk.Label(top, text="Date (YYYY-MM-DD)").pack(side='left', padx=(6,2))
+        self.user_date = tk.StringVar(value=now_ist().strftime("%Y-%m-%d"))
+        ttk.Entry(top, textvariable=self.user_date, width=12).pack(side='left', padx=4)
+        ttk.Button(top, text="Search Trains", command=self.user_search_trains).pack(side='left', padx=6)
+
+        self.user_search_tree = ttk.Treeview(frm, columns=("id","train_number","train_name","from_dep","to_arr","duration","available_classes"), show='headings')
+        for c in ("id","train_number","train_name","from_dep","to_arr","duration","available_classes"):
+            self.user_search_tree.heading(c, text=c.replace('_',' ').title())
+            self.user_search_tree.column(c, width=140, anchor='center')
+        vsb = ttk.Scrollbar(frm, orient='vertical', command=self.user_search_tree.yview)
+        self.user_search_tree.configure(yscroll=vsb.set)
+        self.user_search_tree.pack(fill='both', expand=True, side='left')
+        vsb.pack(side='left', fill='y')
+
+        # Book button
+        btn_frame = ttk.Frame(frm)
+        btn_frame.pack(fill='x', pady=6)
+        ttk.Button(btn_frame, text="Book Selected Train", command=self.user_open_book).pack(side='left', padx=6)
+
+    def user_search_trains(self):
+        frm = self.user_from.get().strip().upper()
+        to = self.user_to.get().strip().upper()
+        dstr = self.user_date.get().strip()
+        try:
+            _ = datetime.strptime(dstr, "%Y-%m-%d")
+        except:
+            messagebox.showwarning("Validation", "Date must be YYYY-MM-DD")
+            return
+        # simple search: trains where route contains both station codes in order
+        rows = fetch_trains(self.conn)
+        results = []
+        for r in rows:
+            tid, tno, tname, route_json, created = r
+            try:
+                route = json.loads(route_json or "[]")
+            except:
+                route = []
+            codes = [s.get('station_code') for s in route]
+            if frm in codes and to in codes and codes.index(frm) < codes.index(to):
+                # find departure at from and arrival at to (use departure/arrival fields)
+                from_stop = route[codes.index(frm)]
+                to_stop = route[codes.index(to)]
+                dep = from_stop.get('departure') or from_stop.get('arrival') or ""
+                arr = to_stop.get('arrival') or to_stop.get('departure') or ""
+                duration = ""
+                try:
+                    if dep and arr:
+                        dur = datetime.fromisoformat(arr).astimezone(IST) - datetime.fromisoformat(dep).astimezone(IST)
+                        duration = str(dur)
+                except:
+                    duration = ""
+                # available classes: look up coaches and list classes with free seats
+                coaches = fetch_coaches_for_train(self.conn, tid)
+                classes = {}
+                for co in coaches:
+                    cid, cls, label, scount, fare, seats_json = co
+                    try:
+                        seats = json.loads(seats_json or "{}")
+                        free = sum(1 for v in seats.values() if v == "FREE")
+                    except:
+                        free = scount
+                    if free > 0:
+                        classes.setdefault(cls, []).append((label, free, fare, cid))
+                class_summ = "; ".join([f"{cls}: {sum(x[1] for x in vals)} seats" for cls, vals in classes.items()]) or "No seats"
+                results.append((tid, tno, tname, dep, arr, duration, class_summ, json.dumps(classes)))
+        # populate tree
+        for i in self.user_search_tree.get_children():
+            self.user_search_tree.delete(i)
+        for r in results:
+            self.user_search_tree.insert('', 'end', values=(r[0], r[1], r[2], format_dt(r[3]) if r[3] else r[3], format_dt(r[4]) if r[4] else r[4], r[5], r[6]), tags=(r[7],))
+
+    def user_open_book(self):
+        sel = self.user_search_tree.selection()
+        if not sel:
+            messagebox.showwarning("Select", "Select a train from search results")
+            return
+        item = self.user_search_tree.item(sel[0])
+        values = item['values']
+        # original classes JSON is stored in tags
+        tags = item.get('tags', [])
+        classes_json = tags[0] if tags else "{}"
+        try:
+            classes = json.loads(classes_json)
+        except:
+            classes = {}
+        train_id = values[0]
+        popup = tk.Toplevel(self.root)
+        popup.title("Book Ticket (User)")
+        popup.geometry("620x520")
+        frm = ttk.Frame(popup, padding=10)
+        frm.pack(fill='both', expand=True)
+
+        ttk.Label(frm, text=f"Train: {values[1]} - {values[2]}").pack(anchor='w')
+        ttk.Label(frm, text=f"From: {values[3]}  To: {values[4]}").pack(anchor='w')
+
+        # Choose class
+        ttk.Label(frm, text="Choose Class").pack(anchor='w', pady=(8,0))
+        class_var = tk.StringVar()
+        class_list = list(classes.keys())
+        ttk.Combobox(frm, values=class_list, textvariable=class_var).pack(fill='x')
+
+        # Choose coach after class
+        ttk.Label(frm, text="Choose Coach").pack(anchor='w', pady=(8,0))
+        coach_var = tk.StringVar()
+        coach_combo = ttk.Combobox(frm, values=[], textvariable=coach_var)
+        coach_combo.pack(fill='x')
+
+        def on_class_change(*a):
+            cls = class_var.get()
+            vals = classes.get(cls, [])
+            display = []
+            mapping = {}
+            for label, free, fare, cid in vals:
+                key = f"{label} - Free:{free} - INR {fare}"
+                display.append(key)
+                mapping[key] = (cid, fare)
+            coach_combo['values'] = display
+            coach_combo._map = mapping
+
+        class_var.trace_add('write', on_class_change)
+
+        # seat selection
+        ttk.Label(frm, text="Seat No").pack(anchor='w', pady=(8,0))
+        seat_var = tk.StringVar()
+        seat_combo = ttk.Combobox(frm, values=[], textvariable=seat_var)
+        seat_combo.pack(fill='x')
+
+        def on_coach_selected(*a):
+            sel = coach_var.get()
+            mapping = getattr(coach_combo, '_map', {})
+            info = mapping.get(sel)
+            if not info:
+                seat_combo['values'] = []
+                return
+            cid, fare = info
+            seats = get_coach_seats(self.conn, cid)
+            free_seats = [s for s,v in seats.items() if v == "FREE"]
+            seat_combo['values'] = free_seats
+
+        coach_var.trace_add('write', on_coach_selected)
+
+        # passenger selection (allow using existing passenger or create new)
+        ttk.Label(frm, text="Passenger (Select existing or leave blank to create new below)").pack(anchor='w', pady=(8,0))
+        passengers = fetch_passengers(self.conn)
+        pax_map = {f"{p[0]} - {p[1]}": p for p in passengers}
+        pax_var = tk.StringVar()
+        ttk.Combobox(frm, values=list(pax_map.keys()), textvariable=pax_var).pack(fill='x')
+
+        # new passenger fields
+        ttk.Label(frm, text="If new passenger, fill below:").pack(anchor='w', pady=(8,0))
+        n_name = tk.StringVar()
+        n_email = tk.StringVar()
+        n_phone = tk.StringVar()
+        ttk.Entry(frm, textvariable=n_name).pack(fill='x', pady=(4,0))
+        ttk.Entry(frm, textvariable=n_email).pack(fill='x', pady=(4,0))
+        ttk.Entry(frm, textvariable=n_phone).pack(fill='x', pady=(4,0))
+
+        # payment
+        ttk.Label(frm, text="Payment Method").pack(anchor='w', pady=(8,0))
+        pay_var = tk.StringVar(value="UPI")
+        ttk.Combobox(frm, values=["Cash","UPI","Card"], textvariable=pay_var).pack(fill='x')
+
+        def submit():
+            cls = class_var.get()
+            coach_sel = coach_var.get()
+            seat = seat_var.get()
+            if not cls or not coach_sel or not seat:
+                messagebox.showwarning("Validation", "Choose class, coach and seat")
+                return
+            mapping = getattr(coach_combo, '_map', {})
+            info = mapping.get(coach_sel)
+            if not info:
+                messagebox.showerror("Error", "Coach invalid")
+                return
+            cid, fare = info
+            # passenger
+            paxsel = pax_var.get()
+            if paxsel:
+                pax = pax_map.get(paxsel)
+                pid = pax[0]
+            else:
+                # create new
+                n = n_name.get().strip()
+                em = n_email.get().strip()
+                ph = n_phone.get().strip()
+                if not n:
+                    messagebox.showwarning("Validation", "Provide passenger name")
+                    return
+                if em and not valid_email(em):
+                    messagebox.showwarning("Validation", "Invalid email")
+                    return
+                if ph and not valid_phone(ph):
+                    messagebox.showwarning("Validation", "Invalid phone")
+                    return
+                pid = add_passenger(self.conn, n, em, ph)
+            # train departure
+            cur = self.conn.cursor()
+            cur.execute("SELECT route_json FROM trains WHERE id=?", (train_id,))
+            rr = cur.fetchone()
+            route = json.loads(rr[0] or "[]")
+            dep = None
+            for s in route:
+                if s.get('departure'):
+                    dep = s['departure']
+                    break
+            if not dep:
+                messagebox.showwarning("No departure", "Train has no departure for selected date/time")
+                return
+            depdt = datetime.fromisoformat(dep).astimezone(IST)
+            if depdt <= now_ist():
+                messagebox.showwarning("Time", "Train departure not in future")
+                return
+            # book
+            try:
+                bid, pnr = book_seat(self.conn, train_id, cid, seat, pid, cls, float(fare), dep, self.user['id'])
+                record_payment(self.conn, bid, pay_var.get(), float(fare))
+                messagebox.showinfo("Booked", f"Booking successful. PNR: {pnr}")
+                popup.destroy()
+            except Exception as e:
+                messagebox.showerror("Booking error", str(e))
+
+        ttk.Button(frm, text="Book Now", command=submit).pack(pady=12)
+
+    def build_user_bookings_tab(self):
+        frm = self.tab_mybookings
+        top = ttk.Frame(frm)
+        top.pack(fill='x', pady=4)
+        ttk.Button(top, text="Refresh", command=self.load_user_bookings).pack(side='left')
+        ttk.Button(top, text="Cancel Selected", command=self.user_cancel_booking).pack(side='left', padx=6)
+        ttk.Button(top, text="Print Selected", command=self.user_print_ticket).pack(side='left', padx=6)
+        self.user_book_tree = ttk.Treeview(frm, columns=("id","pnr","train","coach","seat","status","fare","depart"), show='headings')
+        for c in ("id","pnr","train","coach","seat","status","fare","depart"):
+            self.user_book_tree.heading(c, text=c.title())
+            self.user_book_tree.column(c, width=140, anchor='center')
+        vsb = ttk.Scrollbar(frm, orient='vertical', command=self.user_book_tree.yview)
+        self.user_book_tree.configure(yscroll=vsb.set)
+        self.user_book_tree.pack(fill='both', expand=True, side='left')
+        vsb.pack(side='left', fill='y')
+        self.load_user_bookings()
+
+    def load_user_bookings(self):
+        for i in self.user_book_tree.get_children():
+            self.user_book_tree.delete(i)
+        cur = self.conn.cursor()
+        cur.execute('''
+        SELECT b.id, b.pnr, t.train_number || ' - ' || t.train_name, c.coach_label, b.seat_no, b.status, b.fare_paid, b.departure_time
+        FROM bookings b JOIN trains t ON b.train_id=t.id JOIN train_coaches c ON b.coach_id=c.id
+        WHERE b.user_id=?
+        ORDER BY b.id
+        ''', (self.user['id'],))
+        rows = cur.fetchall()
+        for r in rows:
+            self.user_book_tree.insert('', 'end', values=(r[0], r[1], r[2], r[3], r[4], r[5], r[6], format_dt(r[7])))
+
+    def user_cancel_booking(self):
+        sel = self.user_book_tree.selection()
+        if not sel:
+            messagebox.showwarning("Select", "Select booking")
+            return
+        data = self.user_book_tree.item(sel[0])['values']
+        bid = data[0]
+        if messagebox.askyesno("Confirm", "Cancel booking?"):
+            try:
+                refund = cancel_booking(self.conn, bid)
+                messagebox.showinfo("Cancelled", f"Cancelled. Refund INR {refund:.2f}")
+                self.load_user_bookings()
+            except Exception as e:
+                messagebox.showerror("Error", str(e))
+
+    def user_print_ticket(self):
+        sel = self.user_book_tree.selection()
+        if not sel:
+            messagebox.showwarning("Select", "Select booking")
+            return
+        data = self.user_book_tree.item(sel[0])['values']
+        bid = data[0]
+        # find booking details and save similarly as admin
+        cur = self.conn.cursor()
+        cur.execute("SELECT pnr, train_id, coach_id, seat_no, passenger_id, travel_class, booking_time, status, fare_paid, departure_time FROM bookings WHERE id=?", (bid,))
+        row = cur.fetchone()
+        if not row:
+            messagebox.showerror("Error", "Booking not found")
+            return
+        pnr, train_id, coach_id, seat_no, passenger_id, travel_class, booking_time, status, fare_paid, departure_time = row
+        cur.execute("SELECT train_number, train_name FROM trains WHERE id=?", (train_id,))
+        tr = cur.fetchone()
+        cur.execute("SELECT coach_label FROM train_coaches WHERE id=?", (coach_id,))
+        co = cur.fetchone()
+        cur.execute("SELECT name, email, phone FROM passengers WHERE id=?", (passenger_id,))
+        pa = cur.fetchone()
+        booking_info = {"pnr": pnr, "travel_class": travel_class, "seat_no": seat_no, "booking_time": booking_time, "status": status, "fare_paid": fare_paid, "departure_time": departure_time}
+        train_info = {"train_number": tr[0], "train_name": tr[1]}
+        coach_info = {"coach_label": co[0]}
+        passenger_info = {"name": pa[0], "email": pa[1], "phone": pa[2]}
+
+        fn = filedialog.asksaveasfilename(defaultextension='.txt', initialfile=f"{pnr}.txt", filetypes=[("Text files","*.txt"),("PDF files","*.pdf")])
+        if not fn: return
+        if fn.lower().endswith('.pdf'):
+            ok, err = save_ticket_pdf(fn, booking_info, passenger_info, train_info, coach_info)
+            if ok:
+                messagebox.showinfo("Saved", f"Ticket saved to {fn}")
+            else:
+                messagebox.showerror("PDF Error", f"Could not save PDF: {err}")
+        else:
+            ok = save_ticket_text(fn, booking_info, passenger_info, train_info, coach_info)
+            if ok:
+                messagebox.showinfo("Saved", f"Ticket saved to {fn}")
+            else:
+                messagebox.showerror("Error", "Failed to save ticket")
+
+# ----------------- Start App -----------------
+
+def ensure_db():
+    conn = create_connection(DB_FILE)
+    if conn:
+        create_tables(conn)
+    return conn
+
+def main():
+    conn = ensure_db()
+    root = tk.Tk()
+    app = RailwayApp(root, conn)
+    root.mainloop()
+
+if __name__ == '__main__':
+    main()
